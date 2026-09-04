@@ -1,85 +1,96 @@
 # paqet-tunnel
 
-A lightweight installer and web management layer for tunneling VPN traffic with [paqet](https://github.com/hanselime/paqet).
+Easy installer for tunneling VPN traffic through a middle server using [paqet](https://github.com/hanselime/paqet) — raw packet-level tunneling that bypasses network restrictions.
 
 **Version:** v2.1.0
-**Author / Maintainer:** durwinam
-**Original author attribution:** g3ntrix
-**Web Panel:** `6102`
 
-## ✨ Web Panel
+**Web Panel:** Glassmorphism control panel on port `6102`
 
-The new Web Panel is an independent management layer. The existing paqet tunnel setup and service model are kept intact; the panel controls and observes the existing services instead of replacing the tunnel engine.
+**Maintainer:** durwinam
 
-### Included
+## How it works
 
-- 🧊 Glassmorphism UI with animated background
-- 🌑 Dark / ☀️ Light / 🌓 System theme
-- ✨ Animated loading screen and page transitions
-- 🧩 Custom inline SVG visual system
-- 🌍 Abroad / Iran tunnel visualization
-- 📡 Ping and packet-loss diagnostics
-- ⚡ Server-side speed-test integration when `speedtest` or `speedtest-cli` is installed
-- 📊 CPU / RAM / disk / uptime monitoring
-- 🔗 Tunnel service start / stop / restart
-- 📋 Recent systemd logs
-- 🔐 Admin login with generated initial password
-- 📱 Responsive mobile layout
+Clients connect to **Server A** (the Iran entry point), which tunnels traffic over an encrypted paqet/KCP link to **Server B** (abroad), where your V2Ray/X-UI runs. You only change the IP in your VPN client from Server B to Server A — nothing else.
+
+```
+Client ──▶ Server A (Iran) ══ paqet tunnel ══▶ Server B (abroad) ──▶ V2Ray
+```
 
 ## Install
 
-Run the existing installer as root on the relevant tunnel server:
+Run on **both** servers (as root):
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/durwinam/paqet-tunnel/main/install.sh)
 ```
 
-After the tunnel is configured, choose the Web Panel option from the installer menu. The panel listens on:
+The first run is a guided wizard: it asks whether this machine is the abroad server or the Iran server, auto-detects the network, and walks you through the rest.
 
-```text
-http://SERVER_IP:6102
+## Setup (two steps)
+
+**1. Server B (abroad)** — choose **Abroad server (B)**:
+- Confirm the detected network, pick the paqet port (default `8888`), enter your V2Ray port(s).
+- Copy the **Connection String** it prints at the end (`paqet://…`).
+
+**2. Server A (Iran)** — choose **Iran entry server (A)**:
+- Give the tunnel a name, then **paste the Connection String** — it fills in the IP, port, key, and ports automatically.
+- A health check confirms the tunnel is live.
+
+Then point your VPN client at **Server A's IP** instead of Server B's.
+
+> To reach more abroad servers, run Server A setup again with a different tunnel name.
+
+## ⚠️ Required: V2Ray must listen on 0.0.0.0
+
+On **Server B**, set your V2Ray/X-UI inbound **Listen IP** to `0.0.0.0` (not the public IP, not empty). paqet delivers traffic to `127.0.0.1:PORT`, so V2Ray must accept localhost connections.
+
+## Handy menu options
+
+- **c** — Health check (verify the tunnel end-to-end)
+- **k** — Show the Connection String again (Server B)
+- **3** Status · **5** Edit config · **6** Manage tunnels · **u** Uninstall
+- **i** — Install as the `paqet-tunnel` command (then just run `paqet-tunnel`)
+
+## Commands
+
+```bash
+# Server B
+systemctl status paqet
+journalctl -u paqet -f
+
+# Server A (per tunnel — <name> is your tunnel name)
+systemctl status paqet-<name>
+journalctl -u paqet-<name> -f
 ```
 
-The panel is managed as `paqet-panel.service` and starts automatically after reboot.
+## Troubleshooting
 
-> Open TCP port `6102` in your VPS/cloud firewall if the panel must be reachable remotely.
+- **`connection lost, retrying` / health check fails** — on Server A, the paqet port must be Server B's **tunnel port** (e.g. `8888`), not the V2Ray port. Re-run setup, or paste the Connection String so it's filled in automatically.
+- **Clients can't connect** — confirm V2Ray listens on `0.0.0.0`, and the cloud firewall allows the paqet port on Server B.
+- **Download blocked in Iran** — grab the paqet binary from [releases](https://github.com/hanselime/paqet/releases) and give the installer the local file path when prompted.
+- **High latency** — usually the underlying Iran↔abroad route. Compare with a direct `ping` between the two servers; the tunnel can't go faster than that baseline.
 
-## Tunnel architecture
+## Requirements
 
-The tunnel architecture remains the same:
-
-```text
-Client → Server A (Iran entry) ══ paqet/KCP ══→ Server B (abroad) → V2Ray/X-UI
-```
-
-The Web Panel is an additional control plane:
-
-```text
-                 PAQET TUNNEL
-                       │
-          ┌────────────┴────────────┐
-          │                         │
-      Tunnel Core               Web Panel
-      Existing flow              :6102
-          │                         │
-      paqet/systemd          Dashboard / Tunnels
-                              Network / Logs / Settings
-```
-
-## First login
-
-On first panel installation, a strong random password is generated under:
-
-```text
-/opt/paqet/panel/auth.json
-```
-
-The installer prints the initial password. Change it from **Settings → Password** after signing in.
+Linux (Ubuntu / Debian / CentOS), root access, `libpcap` and `iptables` (auto-installed).
 
 ## Credits & License
 
-This project integrates with and builds around [paqet](https://github.com/hanselime/paqet) by hanselime.
+Built on [paqet](https://github.com/hanselime/paqet) by hanselime. MIT License.
 
-Copyright attribution is retained for the original project author while `durwinam` is the current author/maintainer of this project version.
 
-MIT License.
+## Web Panel
+
+The optional Web Panel is a separate management layer and does not replace or rewrite the existing paqet tunnel engine. Install it from the project directory as root:
+
+```bash
+bash panel/install.sh
+```
+
+Open `http://SERVER_IP:6102`. The installer generates a unique admin password and prints it once.
+
+Panel features include Glass UI, Dark/Light/System themes, animated loading screen, custom PAQET logo, tunnel topology, service controls, ping, packet-loss diagnostics, server-side speed test, system metrics and journal logs.
+
+## Credits
+
+The tunnel engine is based on [paqet](https://github.com/hanselime/paqet) by hanselime. Original project attribution is preserved; Web Panel and project modifications are by `durwinam`.

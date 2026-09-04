@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#080a12"><title>PAQET TUNNEL</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body><div id="login" class="login"><div class="login-card glass"><img src="/assets/paqet-logo.jpg"><span class="eyebrow">SECURE CONTROL PLANE</span><h1>PAQET TUNNEL</h1><p>Sign in to manage your tunnel.</p><input id="user" value="admin" placeholder="Username"><input id="pass" type="password" placeholder="Password"><button class="primary" id="loginBtn">Enter Panel</button><small id="loginErr"></small></div></div>
+<div id="loader" class="loader"><div class="loader-orbit"></div><div class="loader-logo"><img src="//assets/paqet-logo.jpg" alt="PAQET"></div><div class="loader-title">PAQET <span>TUNNEL</span></div><div class="loader-line"><i></i></div><div class="loader-text" id="loaderText">Initializing secure control plane...</div></div>
+<div class="ambient a1"></div><div class="ambient a2"></div><div class="grid"></div>
+<div class="app" id="app">
+<aside class="sidebar glass">
+  <div class="brand"><img src="//assets/paqet-logo.jpg"><div><b>PAQET</b><small>TUNNEL</small></div></div>
+  <nav>
+   <button class="nav active" data-page="dashboard"><span class="ico">⌂</span>Dashboard</button>
+   <button class="nav" data-page="tunnels"><span class="ico">↔</span>Tunnels</button>
+   <button class="nav" data-page="network"><span class="ico">◉</span>Network</button>
+   <button class="nav" data-page="logs"><span class="ico">≋</span>Live Logs</button>
+   <button class="nav" data-page="settings"><span class="ico">⚙</span>Settings</button>
+  </nav>
+  <div class="side-foot"><div class="status-dot" id="sideDot"></div><span id="sideStatus">Connecting</span><small>Port 6102</small></div>
+</aside>
+<main>
+<header class="top"><div><span class="eyebrow">SECURE CONTROL PLANE</span><h1 id="pageTitle">Dashboard</h1></div><div class="actions"><div class="theme glass"><button data-theme-choice="dark">☾</button><button data-theme-choice="light">☀</button><button data-theme-choice="system">◐</button></div><div class="pill glass"><span class="status-dot" id="topDot"></span><span id="topStatus">Online</span></div></div></header>
+<section id="page-dashboard" class="page active">
+ <div class="hero glass"><div><span class="eyebrow">TUNNEL INFRASTRUCTURE</span><h2>Route traffic with confidence.</h2><p>Monitor the tunnel, test the route and control services from one glass interface.</p></div><div class="hero-node"><div class="pulse"></div><span id="roleLabel">Detecting host...</span></div></div>
+ <div class="stats"><article class="stat glass"><span class="ico big">↔</span><div><small>ACTIVE TUNNELS</small><strong id="tunnelCount">0</strong></div></article><article class="stat glass"><span class="ico big">⚡</span><div><small>LATENCY</small><strong id="latency">—</strong></div></article><article class="stat glass"><span class="ico big">CPU</span><div><small>CPU LOAD</small><strong id="cpu">—</strong></div></article><article class="stat glass"><span class="ico big">RAM</span><div><small>MEMORY</small><strong id="ram">—</strong></div></article></div>
+ <div class="grid2"><article class="glass panel"><div class="panel-head"><div><span class="eyebrow">ROUTE MAP</span><h3>Tunnel topology</h3></div><span class="badge" id="healthBadge">Checking</span></div><div class="route"><div class="node"><span class="flag">🌍</span><b>خارج</b><small>Server A</small><em id="serverA">—</em></div><div class="route-line"><span></span><small>PAQET</small></div><div class="node"><span class="flag">🇮🇷</span><b>ایران</b><small>Server B</small><em id="serverB">—</em></div></div></article>
+ <article class="glass panel"><div class="panel-head"><div><span class="eyebrow">NETWORK TOOLS</span><h3>Quick diagnostics</h3></div></div><div class="tool-row"><button class="primary" id="pingBtn">◉ Ping Tunnel</button><button class="secondary" id="speedBtn">⚡ Speed Test</button></div><div class="result" id="diagResult">Ready for a diagnostic.</div></article></div>
+ <div class="grid2"><article class="glass panel"><div class="panel-head"><div><span class="eyebrow">SYSTEM</span><h3>Server health</h3></div></div><div class="meters"><div><label>Disk <b id="diskText">—</b></label><div class="meter"><i id="diskBar"></i></div></div><div><label>Uptime <b id="uptime">—</b></label><div class="uptime-line"></div></div></div></article><article class="glass panel"><div class="panel-head"><div><span class="eyebrow">TRAFFIC</span><h3>Interface totals</h3></div></div><div class="traffic"><div><small>DOWNLOAD</small><b id="rx">—</b></div><div><small>UPLOAD</small><b id="tx">—</b></div></div></article></div>
+</section>
+<section id="page-tunnels" class="page"><div class="section-head"><div><span class="eyebrow">MANAGEMENT</span><h2>Active tunnels</h2></div></div><div id="tunnels" class="tunnel-list"></div></section>
+<section id="page-network" class="page"><div class="glass panel"><div class="panel-head"><div><span class="eyebrow">NETWORK MONITOR</span><h3>Route diagnostics</h3></div></div><div class="network-box"><div><small>LOCAL IP</small><b id="nLocal">—</b></div><div><small>PUBLIC IP</small><b id="nPublic">—</b></div><div><small>HOSTNAME</small><b id="nHost">—</b></div></div><div class="tool-row"><input id="pingHost" value="1.1.1.1" placeholder="Host or IP"><button class="primary" id="pingCustom">Run Ping</button><button class="secondary" id="speedCustom">Run Speed Test</button></div><div class="result" id="networkResult">No test yet.</div></div></section>
+<section id="page-logs" class="page"><div class="glass panel"><div class="panel-head"><div><span class="eyebrow">LIVE</span><h3>Service logs</h3></div><select id="logService"><option value="paqet">paqet</option></select><button class="secondary" id="refreshLogs">Refresh</button></div><pre id="logs">Logs are loaded from the active tunnel service on demand.</pre></div></section>
+<section id="page-settings" class="page"><div class="glass panel"><div class="panel-head"><div><span class="eyebrow">PREFERENCES</span><h3>Panel settings</h3></div></div><div class="settings"><div><b>Theme</b><span>Choose Dark, Light or follow the system.</span></div><div class="setting-actions"><button data-theme-choice="dark">Dark</button><button data-theme-choice="light">Light</button><button data-theme-choice="system">System</button></div><div><b>Panel port</b><span>Fixed management port</span></div><strong>6102</strong><div><b>Project</b><span>paqet-tunnel · durwinam</span></div></div></div></section>
+<footer>PAQET TUNNEL · v2.1.0 · MIT · durwinam + original attribution preserved</footer>
+</main></div>
+<script src="/app.js"></script>
+</body></html>

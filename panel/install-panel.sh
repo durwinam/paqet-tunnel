@@ -1,7 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-PANEL_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "${PAQET_PANEL_SOURCE:-}" ] && [ -d "${PAQET_PANEL_SOURCE}" ]; then
+  PANEL_SRC="${PAQET_PANEL_SOURCE}"
+else
+  PANEL_SCRIPT="${BASH_SOURCE[0]:-}"
+  if [[ -n "$PANEL_SCRIPT" && "$PANEL_SCRIPT" != /dev/fd/* && "$PANEL_SCRIPT" != /proc/* ]]; then
+    PANEL_SRC="$(cd "$(dirname "$(readlink -f "$PANEL_SCRIPT")")" && pwd)"
+  else
+    PANEL_SRC="$PWD"
+  fi
+fi
 PANEL_DIR="/opt/paqet/panel"
 
 if [ "$(id -u)" -ne 0 ]; then

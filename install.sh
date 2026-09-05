@@ -3974,6 +3974,12 @@ install_command() {
     if curl -fsSL "$download_url" -o "$temp_script" 2>/dev/null; then
         chmod +x "$temp_script"
         mv "$temp_script" "$INSTALLER_CMD"
+        local local_root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+        if [ -d "$local_root/panel" ]; then
+            mkdir -p /opt/paqet-tunnel
+            rm -rf /opt/paqet-tunnel/panel
+            cp -a "$local_root/panel" /opt/paqet-tunnel/panel
+        fi
         print_success "paqet-tunnel command installed successfully!"
     else
         # If download fails, copy current script
@@ -4084,11 +4090,35 @@ run_manage_menu() {
 
 
 install_web_panel() {
-    local src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/panel"
-    if [ ! -d "$src_dir" ]; then print_error "Web Panel files not found."; return 1; fi
-    print_header "Installing Web Panel"
-    bash "$src_dir/install-panel.sh"
-    print_success "Web Panel installed on port 6102."
+    print_banner
+    print_step "Installing PAQET Web Panel on port 6102..."
+
+    local source_dir
+    source_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+    local candidates=(
+        "$source_dir/panel"
+        "/opt/paqet-tunnel/panel"
+        "/opt/paqet-tunnel-main/panel"
+    )
+
+    local panel_dir=""
+    for candidate in "${candidates[@]}"; do
+        if [ -f "$candidate/install-panel.sh" ] && [ -f "$candidate/server.py" ] && [ -f "$candidate/static/index.html" ]; then
+            panel_dir="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$panel_dir" ]; then
+        print_error "Web Panel files not found."
+        print_info "Expected panel/install-panel.sh, panel/server.py and panel/static/index.html."
+        return 1
+    fi
+
+    chmod +x "$panel_dir/install-panel.sh"
+    bash "$panel_dir/install-panel.sh"
+    return $?
 }
 
 main() {

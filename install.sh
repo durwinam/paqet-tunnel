@@ -4094,7 +4094,15 @@ install_web_panel() {
     print_step "Installing PAQET Web Panel on port 6102..."
 
     local source_dir
-    source_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+    # The installer may be executed normally or through process substitution
+    # (for example: bash <(curl ...)). In the latter case BASH_SOURCE can be
+    # /dev/fd/*, whose /proc entry may disappear while the menu is running.
+    local script_path="${BASH_SOURCE[0]:-}"
+    if [[ -n "$script_path" && "$script_path" != /dev/fd/* && "$script_path" != /proc/* ]]; then
+        source_dir="$(cd "$(dirname "$(readlink -f "$script_path")")" && pwd)"
+    else
+        source_dir="${PAQET_SOURCE_DIR:-$PWD}"
+    fi
 
     local candidates=(
         "$source_dir/panel"
@@ -4117,7 +4125,7 @@ install_web_panel() {
     fi
 
     chmod +x "$panel_dir/install-panel.sh"
-    bash "$panel_dir/install-panel.sh"
+    PAQET_PANEL_SOURCE="$panel_dir" bash "$panel_dir/install-panel.sh"
     return $?
 }
 

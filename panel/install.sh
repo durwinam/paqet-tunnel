@@ -6,8 +6,10 @@ PORT="6102"
 mkdir -p "$BASE/static/assets"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cp "$SCRIPT_DIR/server.py" "$BASE/server.py"
-cp "$SCRIPT_DIR/static/"* "$BASE/static/"
-cp "$SCRIPT_DIR/static/assets/paqet-logo.jpg" "$BASE/static/assets/paqet-logo.jpg"
+cp -f "$SCRIPT_DIR/static/"*.html "$BASE/static/"
+cp -f "$SCRIPT_DIR/static/"*.js "$BASE/static/"
+cp -f "$SCRIPT_DIR/static/"*.css "$BASE/static/"
+cp -rf "$SCRIPT_DIR/static/assets/." "$BASE/static/assets/"
 PASS=$(python3 - <<'PY2'
 import secrets
 print(''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789') for _ in range(14)))

@@ -4110,6 +4110,14 @@ install_web_panel() {
         "/opt/paqet-tunnel-main/panel"
     )
 
+    # When the main installer is executed from a temporary extracted package
+    # (or via process substitution), its BASH_SOURCE may be /dev/fd/*.
+    # Look for the bundled panel in the temporary package as well.
+    local tmp_panel
+    for tmp_panel in /tmp/paqet-panel.*/paqet-tunnel-main/panel; do
+        [ -d "$tmp_panel" ] && candidates+=("$tmp_panel")
+    done
+
     local panel_dir=""
     for candidate in "${candidates[@]}"; do
         if [ -f "$candidate/install-panel.sh" ] && [ -f "$candidate/server.py" ] && [ -f "$candidate/static/index.html" ]; then

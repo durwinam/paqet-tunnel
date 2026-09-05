@@ -64,7 +64,7 @@ print_banner() {
     print_banner_line ""
     print_banner_line "Raw Packet Tunnel - Firewall Bypass"
     print_banner_line "Version: v${INSTALLER_VERSION}"
-    print_banner_line "Maintained by durwinam"
+    print_banner_line "Created by durwinam • Original author: g3ntrix"
     print_banner_line "Support this project: press 'h' in main menu"
     print_banner_line ""
     echo "╚═══════════════════════════════════════════════╝"
@@ -3860,7 +3860,7 @@ check_for_updates() {
     if [ "$INSTALLER_VERSION" = "$latest_version" ]; then
         echo ""
         echo -e "${YELLOW}Check out my latest tunnel project (SMTP-based):${NC}"
-        echo -e "  ${CYAN}https://github.com/durwinam/paqet-tunnel${NC}"
+        echo -e "  ${CYAN}https://github.com/g3ntrix/smtp-tunnel${NC}"
         echo ""
         print_success "You are running the latest version!"
         return 0
@@ -3913,7 +3913,7 @@ update_installer() {
             
             echo ""
             echo -e "${YELLOW}Check out my latest tunnel project (SMTP-based):${NC}"
-            echo -e "  ${CYAN}https://github.com/durwinam/paqet-tunnel${NC}"
+            echo -e "  ${CYAN}https://github.com/g3ntrix/smtp-tunnel${NC}"
             echo ""
             print_step "Launching updated installer..."
             echo ""
@@ -4079,44 +4079,22 @@ run_manage_menu() {
 }
 
 #===============================================================================
-#===============================================================================
-# Web Panel (optional management UI)
-#===============================================================================
-install_web_panel() {
-    print_banner
-    print_step "Installing PAQET Web Panel on port 6102..."
-    local source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ -f "$source_dir/panel/install.sh" ] && [ -f "$source_dir/panel/server.py" ]; then
-        bash "$source_dir/panel/install.sh"
-        return $?
-    fi
-
-    local tmp="$(mktemp -d /tmp/paqet-panel.XXXXXX)"
-    trap 'rm -rf "$tmp"' RETURN
-    if ! curl -fsSL "https://github.com/${INSTALLER_REPO}/archive/refs/heads/main.tar.gz" -o "$tmp/repo.tar.gz"; then
-        print_error "Could not download the Web Panel package."
-        return 1
-    fi
-    tar -xzf "$tmp/repo.tar.gz" -C "$tmp"
-    local repo_dir="$tmp/paqet-tunnel-main/panel"
-    if [ ! -f "$repo_dir/install.sh" ]; then
-        print_error "Web Panel package is incomplete."
-        return 1
-    fi
-    bash "$repo_dir/install.sh"
-}
-
 # Main Menu
 #===============================================================================
+
+
+install_web_panel() {
+    local src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/panel"
+    if [ ! -d "$src_dir" ]; then print_error "Web Panel files not found."; return 1; fi
+    print_header "Installing Web Panel"
+    bash "$src_dir/install-panel.sh"
+    print_success "Web Panel installed on port 6102."
+}
 
 main() {
     # Parse command line arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --web-panel)
-                INSTALL_WEB_PANEL=true
-                shift
-                ;;
             --offline)
                 OFFLINE_MODE=true
                 shift
@@ -4128,11 +4106,6 @@ main() {
     done
 
     check_root
-
-    if [ "${INSTALL_WEB_PANEL:-false}" = true ]; then
-        install_web_panel
-        exit $?
-    fi
 
     # Auto-sync: if paqet-tunnel command exists but is outdated, update it silently
     if is_command_installed; then
@@ -4176,7 +4149,7 @@ main() {
             if ! is_command_installed; then
                 echo -e "  ${CYAN}i)${NC} Install as 'paqet-tunnel' command"
             fi
-            echo -e "  ${CYAN}w)${NC} Install Web Panel (port 6102)"
+            echo -e "  ${CYAN}w)${NC} Install / Reinstall Web Panel (port 6102)"
             echo -e "  ${CYAN}h)${NC} Donate / Support project"
             echo -e "  ${CYAN}0)${NC} Exit"
             echo ""
@@ -4223,8 +4196,8 @@ main() {
             if ! is_command_installed; then
                 echo -e "  ${CYAN}i)${NC} Install as 'paqet-tunnel' command"
             fi
-            echo -e "  ${CYAN}w)${NC} Install Web Panel (port 6102)"
             echo -e "  ${CYAN}r)${NC} Remove paqet-tunnel command"
+            echo -e "  ${CYAN}w)${NC} Install / Reinstall Web Panel (port 6102)"
             echo -e "  ${CYAN}h)${NC} Donate / Support project"
             echo -e "  ${CYAN}0)${NC} Exit"
             echo ""
@@ -4260,8 +4233,8 @@ main() {
             [Ff]) iptables_port_forwarding_menu ;;
             [Uu]) uninstall ;;
             [Ii]) install_command ;;
-            [Ww]) install_web_panel ;;
             [Rr]) uninstall_command ;;
+            [Ww]) install_web_panel ;;
             [Hh]) show_donate_info ;;
             0) exit 0 ;;
             *) print_error "Invalid choice" ;;

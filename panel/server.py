@@ -1,279 +1,523 @@
 #!/usr/bin/env python3
-import json, os, re, socket, subprocess, time, secrets, hashlib
-from http import cookies
+import base64
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
-HOST = os.environ.get('PAQET_PANEL_HOST', '0.0.0.0')
+HOST = '0.0.0.0'
 PORT = int(os.environ.get('PAQET_PANEL_PORT', '6102'))
-ROOT = os.path.dirname(os.path.abspath(__file__))
-STATIC = os.path.join(ROOT, 'static')
-PAQET_DIR = os.environ.get('PAQET_DIR', '/opt/paqet')
-CREDENTIALS = os.path.join(ROOT, 'credentials.json')
+PAQET_DIR = '/opt/paqet'
+STATE_DIR = os.path.join(PAQET_DIR, 'panel')
+STATE_FILE = os.path.join(STATE_DIR, 'auth.json')
+META_FILE = os.path.join(STATE_DIR, 'tunnels.json')
+STATIC_DIR = os.path.join(os.path.dirname(__file__), 'static')
+ASSET_DIR = os.path.join(STATIC_DIR, 'assets')
+
+os.makedirs(STATE_DIR, exist_ok=True)
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json(path, value, mode=0o600):
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    os.chmod(path, mode)
+
+
+def load_auth():
+    data = read_json(STATE_FILE, None)
+    if isinstance(data, dict) and data.get('username') and data.get('password_sha256'):
+        return data
+    pw = secrets.token_urlsafe(12)
+    data = {
+        'username': 'admin',
+        'password_sha256': hashlib.sha256(pw.encode()).hexdigest(),
+        'generated_password': pw,
+    }
+    write_json(STATE_FILE, data)
+    return data
+
+
+AUTH = load_auth()
 SESSIONS = set()
 
 
-def run(cmd, timeout=8):
+def run(cmd, timeout=8, input_text=None):
     try:
-        p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=timeout, check=False)
+        p = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=timeout, input=input_text,
+        )
         return p.returncode, p.stdout.strip()
     except Exception as e:
         return 1, str(e)
 
 
-def service_active(name):
-    rc, _ = run(['systemctl', 'is-active', '--quiet', name], 3)
-    return rc == 0
-
-
-def get_role(path):
+def valid_ip(value):
     try:
-        with open(path, encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                if line.strip().startswith('role:'):
-                    return line.split(':', 1)[1].strip().strip('"\'')
-    except OSError:
+        ipaddress.ip_address(value)
+        return True
+    except Exception:
+        return False
+
+
+def valid_port(value):
+    try:
+        n = int(value)
+        return 1 <= n <= 65535
+    except Exception:
+        return False
+
+
+def valid_ports(value):
+    parts = [p.strip() for p in str(value).split(',') if p.strip()]
+    return bool(parts) and all(valid_port(p) for p in parts)
+
+
+def get_default_interface():
+    rc, out = run(['ip', 'route'], 3)
+    for line in out.splitlines():
+        m = re.match(r'\s*default\s+.*\sdev\s+(\S+)', line)
+        if m:
+            return m.group(1)
+    return ''
+
+
+def get_local_ip(interface):
+    if not interface:
+        return ''
+    rc, out = run(['ip', '-4', 'addr', 'show', interface], 3)
+    m = re.search(r'inet\s+(\d+(?:\.\d+){3})/', out)
+    return m.group(1) if m else ''
+
+
+def get_gateway_ip():
+    rc, out = run(['ip', 'route'], 3)
+    for line in out.splitlines():
+        m = re.match(r'\s*default\s+via\s+(\S+)', line)
+        if m:
+            return m.group(1)
+    return ''
+
+
+def get_gateway_mac():
+    gateway = get_gateway_ip()
+    if not gateway:
+        return ''
+    run(['ping', '-c', '1', '-W', '1', gateway], 3)
+    rc, out = run(['ip', 'neigh', 'show', gateway], 3)
+    m = re.search(r'([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', out)
+    if m:
+        return m.group(0)
+    return ''
+
+
+def get_public_ip():
+    for url in ('https://api.ipify.org', 'https://ifconfig.me', 'https://icanhazip.com'):
+        rc, out = run(['curl', '-4', '-fsS', '--max-time', '3', url], 5)
+        if rc == 0 and valid_ip(out.strip()):
+            return out.strip()
+    return get_local_ip(get_default_interface())
+
+
+def network_info():
+    iface = get_default_interface()
+    local = get_local_ip(iface)
+    public = get_public_ip()
+    mac = get_gateway_mac()
+    return {
+        'interface': iface,
+        'local_ip': local,
+        'public_ip': public,
+        'gateway_mac': mac,
+        'gateway_ip': get_gateway_ip(),
+    }
+
+
+def save_iptables():
+    if shutil.which('iptables-save'):
+        if os.path.isdir('/etc/iptables'):
+            rc, out = run(['iptables-save'], 8)
+            if rc == 0:
+                try:
+                    with open('/etc/iptables/rules.v4', 'w', encoding='utf-8') as f:
+                        f.write(out + '\n')
+                except Exception:
+                    pass
+
+
+def server_firewall(port):
+    cmds = [
+        ['iptables', '-t', 'raw', '-D', 'PREROUTING', '-p', 'tcp', '--dport', str(port), '-j', 'NOTRACK'],
+        ['iptables', '-t', 'raw', '-D', 'OUTPUT', '-p', 'tcp', '--sport', str(port), '-j', 'NOTRACK'],
+        ['iptables', '-t', 'mangle', '-D', 'OUTPUT', '-p', 'tcp', '--sport', str(port), '--tcp-flags', 'RST', 'RST', '-j', 'DROP'],
+        ['iptables', '-t', 'mangle', '-D', 'PREROUTING', '-p', 'tcp', '--dport', str(port), '--tcp-flags', 'RST', 'RST', '-j', 'DROP'],
+        ['iptables', '-t', 'raw', '-A', 'PREROUTING', '-p', 'tcp', '--dport', str(port), '-j', 'NOTRACK'],
+        ['iptables', '-t', 'raw', '-A', 'OUTPUT', '-p', 'tcp', '--sport', str(port), '-j', 'NOTRACK'],
+        ['iptables', '-t', 'mangle', '-A', 'OUTPUT', '-p', 'tcp', '--sport', str(port), '--tcp-flags', 'RST', 'RST', '-j', 'DROP'],
+        ['iptables', '-t', 'mangle', '-A', 'PREROUTING', '-p', 'tcp', '--dport', str(port), '--tcp-flags', 'RST', 'RST', '-j', 'DROP'],
+    ]
+    if not shutil.which('iptables'):
+        return False
+    for c in cmds:
+        run(c, 4)
+    save_iptables()
+    return True
+
+
+def client_firewall(server_ip, server_port):
+    if not shutil.which('iptables'):
+        return False
+    cmds = [
+        ['iptables', '-t', 'raw', '-D', 'OUTPUT', '-p', 'tcp', '-d', server_ip, '--dport', str(server_port), '-j', 'NOTRACK'],
+        ['iptables', '-t', 'raw', '-D', 'PREROUTING', '-p', 'tcp', '-s', server_ip, '--sport', str(server_port), '-j', 'NOTRACK'],
+        ['iptables', '-t', 'mangle', '-D', 'OUTPUT', '-p', 'tcp', '-d', server_ip, '--dport', str(server_port), '--tcp-flags', 'RST', 'RST', '-j', 'DROP'],
+        ['iptables', '-t', 'mangle', '-D', 'PREROUTING', '-p', 'tcp', '-s', server_ip, '--sport', str(server_port), '--tcp-flags', 'RST', 'RST', '-j', 'DROP'],
+        ['iptables', '-t', 'raw', '-A', 'OUTPUT', '-p', 'tcp', '-d', server_ip, '--dport', str(server_port), '-j', 'NOTRACK'],
+        ['iptables', '-t', 'raw', '-A', 'PREROUTING', '-p', 'tcp', '-s', server_ip, '--sport', str(server_port), '-j', 'NOTRACK'],
+        ['iptables', '-t', 'mangle', '-A', 'OUTPUT', '-p', 'tcp', '-d', server_ip, '--dport', str(server_port), '--tcp-flags', 'RST', 'RST', '-j', 'DROP'],
+        ['iptables', '-t', 'mangle', '-A', 'PREROUTING', '-p', 'tcp', '-s', server_ip, '--sport', str(server_port), '--tcp-flags', 'RST', 'RST', '-j', 'DROP'],
+    ]
+    for c in cmds:
+        run(c, 4)
+    save_iptables()
+    return True
+
+
+def ensure_binary():
+    return os.path.isfile(os.path.join(PAQET_DIR, 'paqet')) and os.access(os.path.join(PAQET_DIR, 'paqet'), os.X_OK)
+
+
+def create_service(name, config):
+    if not re.fullmatch(r'paqet(?:-[A-Za-z0-9_.-]+)?', name):
+        raise ValueError('Invalid service name')
+    unit = f'''[Unit]\nDescription=paqet Raw Packet Tunnel\nAfter=network.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nExecStart=/opt/paqet/paqet run -c {config}\nRestart=always\nRestartSec=5\nLimitNOFILE=65535\n\n[Install]\nWantedBy=multi-user.target\n'''
+    path = f'/etc/systemd/system/{name}.service'
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(unit)
+    run(['systemctl', 'daemon-reload'], 10)
+    run(['systemctl', 'enable', name], 10)
+    rc, out = run(['systemctl', 'restart', name], 15)
+    time.sleep(1)
+    active = run(['systemctl', 'is-active', '--quiet', name], 4)[0] == 0
+    return active, out
+
+
+def encode_connection(ip, port, key, fwd):
+    payload = f'ip={ip};port={port};key={key};fwd={fwd}'
+    raw = base64.urlsafe_b64encode(payload.encode()).decode().rstrip('=')
+    return 'paqet://' + raw
+
+
+def decode_connection(value):
+    value = re.sub(r'\s+', '', str(value or ''))
+    if not value.startswith('paqet://'):
+        raise ValueError('Connection string must start with paqet://')
+    b64 = value[len('paqet://'):]
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', b64):
+        raise ValueError('Malformed connection string')
+    b64 += '=' * ((4 - len(b64) % 4) % 4)
+    try:
+        payload = base64.urlsafe_b64decode(b64.encode()).decode()
+    except Exception:
+        raise ValueError('Could not decode connection string')
+    values = {}
+    for part in payload.split(';'):
+        if '=' in part:
+            k, v = part.split('=', 1)
+            values[k] = v
+    if not valid_ip(values.get('ip', '')) or not valid_port(values.get('port', '')) or not values.get('key'):
+        raise ValueError('Connection string is missing required fields')
+    fwd = values.get('fwd', '9090')
+    if not valid_ports(fwd):
+        raise ValueError('Invalid forward port in connection string')
+    return {'ip': values['ip'], 'port': int(values['port']), 'key': values['key'], 'fwd': fwd}
+
+
+def meta():
+    return read_json(META_FILE, [])
+
+
+def add_meta(item):
+    rows = meta()
+    rows = [x for x in rows if x.get('service') != item.get('service')]
+    rows.append(item)
+    write_json(META_FILE, rows)
+
+
+def service_rows():
+    rc, out = run(['systemctl', 'list-units', '--type=service', '--all', '--no-legend', '--plain'], 6)
+    rows = []
+    if rc == 0:
+        for line in out.splitlines():
+            m = re.match(r'\s*(paqet(?:-[^\s]+)?)\.service\s+(\w+)\s+(\w+)\s+(\w+)\s+(.*)', line)
+            if m:
+                rows.append({'name': m.group(1), 'active': m.group(2), 'status': m.group(5).strip()})
+    return rows
+
+
+def config_text(path=None):
+    path = path or os.path.join(PAQET_DIR, 'config.yaml')
+    try:
+        with open(path, encoding='utf-8') as f:
+            return f.read()
+    except Exception:
+        return ''
+
+
+def infer_endpoints():
+    rows = []
+    for cfg in [os.path.join(PAQET_DIR, 'config.yaml')] + sorted(
+        os.path.join(PAQET_DIR, x) for x in os.listdir(PAQET_DIR) if x.startswith('config-') and x.endswith('.yaml')
+    ) if os.path.isdir(PAQET_DIR) else []:
+        text = config_text(cfg)
+        ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', text)
+        port = ''
+        m = re.search(r'addr:\s*"[^:]+:(\d+)"', text)
+        if m:
+            port = m.group(1)
+        rows.append({'config': cfg, 'ips': list(dict.fromkeys(ips))[:8], 'port': port})
+    return rows
+
+
+def metrics():
+    rc, load = run(['cat', '/proc/loadavg'], 2)
+    load1 = float(load.split()[0]) if rc == 0 and load else 0
+    cpu_count = os.cpu_count() or 1
+    rc, mem = run(['cat', '/proc/meminfo'], 2)
+    total = avail = 0
+    if rc == 0:
+        for l in mem.splitlines():
+            if l.startswith('MemTotal:'): total = int(l.split()[1]) * 1024
+            elif l.startswith('MemAvailable:'): avail = int(l.split()[1]) * 1024
+    used = max(total - avail, 0)
+    rc, df = run(['df', '-B1', PAQET_DIR], 3)
+    disk = {}
+    if rc == 0 and len(df.splitlines()) > 1:
+        x = df.splitlines()[-1].split()
+        if len(x) >= 5:
+            disk = {'total': int(x[1]), 'used': int(x[2]), 'percent': x[4]}
+    try:
+        uptime = float(open('/proc/uptime').read().split()[0])
+    except Exception:
+        uptime = 0
+    return {
+        'load': load1,
+        'cpu_percent': round(min(load1 / cpu_count * 100, 100), 1),
+        'memory': {'total': total, 'used': used, 'percent': round(used / total * 100, 1) if total else 0},
+        'disk': disk,
+        'uptime': uptime,
+    }
+
+
+class H(BaseHTTPRequestHandler):
+    server_version = 'PAQETPanel/2.1'
+
+    def log_message(self, fmt, *args):
         pass
-    return 'unknown'
 
+    def send_bytes(self, raw, content_type='application/octet-stream', code=200):
+        self.send_response(code)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
-def get_value(path, key):
-    pat = re.compile(r'^\s*' + re.escape(key) + r'\s*:\s*["\']?([^"\'\s#]+)')
-    try:
-        with open(path, encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                m = pat.match(line)
-                if m:
-                    return m.group(1)
-    except OSError:
-        pass
-    return None
-
-
-def configs():
-    try:
-        files = [os.path.join(PAQET_DIR, x) for x in os.listdir(PAQET_DIR)
-                 if re.match(r'^config(?:-[^/]+)?\.yaml$', x)]
-    except OSError:
-        return []
-    return sorted(files)
-
-
-def tunnel_name(path):
-    base = os.path.basename(path)
-    return 'default' if base == 'config.yaml' else re.sub(r'^config-|\.yaml$', '', base)
-
-
-def service_for(path):
-    name = tunnel_name(path)
-    return 'paqet' if name == 'default' else 'paqet-' + name
-
-
-def local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('1.1.1.1', 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return '127.0.0.1'
-
-
-def public_ip():
-    rc, out = run(['curl', '-4', '-fsS', '--max-time', '3', 'https://api.ipify.org'], 5)
-    return out if rc == 0 and re.match(r'^\d+\.\d+\.\d+\.\d+$', out) else None
-
-
-def meminfo():
-    data = {}
-    try:
-        with open('/proc/meminfo') as f:
-            for line in f:
-                k, v = line.split(':', 1)
-                data[k] = int(v.strip().split()[0])
-        total = data.get('MemTotal', 0)
-        avail = data.get('MemAvailable', data.get('MemFree', 0))
-        used = max(total - avail, 0)
-        return {'total_mb': round(total/1024), 'used_mb': round(used/1024),
-                'percent': round(used*100/total, 1) if total else 0}
-    except Exception:
-        return {'total_mb': 0, 'used_mb': 0, 'percent': 0}
-
-
-def cpu_percent():
-    try:
-        def read():
-            vals = open('/proc/stat').readline().split()[1:]
-            nums = list(map(int, vals))
-            idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
-            return sum(nums), idle
-        a = read(); time.sleep(.08); b = read()
-        total = b[0]-a[0]; idle = b[1]-a[1]
-        return round((total-idle)*100/total, 1) if total else 0
-    except Exception:
-        return 0
-
-
-def disk():
-    rc, out = run(['df', '-P', '/'], 3)
-    try:
-        row = out.splitlines()[-1].split()
-        return {'total': row[1], 'used': row[2], 'free': row[3], 'percent': int(row[4].rstrip('%'))}
-    except Exception:
-        return {'total': '-', 'used': '-', 'free': '-', 'percent': 0}
-
-
-def uptime():
-    try:
-        seconds = float(open('/proc/uptime').read().split()[0])
-        d, rem = divmod(int(seconds), 86400)
-        h, rem = divmod(rem, 3600)
-        m = rem // 60
-        return f'{d}d {h}h {m}m' if d else f'{h}h {m}m'
-    except Exception:
-        return '-'
-
-
-def traffic():
-    rx = tx = 0
-    try:
-        with open('/proc/net/dev') as f:
-            for line in f:
-                if ':' not in line: continue
-                vals = line.split(':', 1)[1].split()
-                if len(vals) >= 9:
-                    rx += int(vals[0]); tx += int(vals[8])
-    except Exception:
-        pass
-    return {'rx_bytes': rx, 'tx_bytes': tx}
-
-
-def state():
-    cs = configs()
-    items = []
-    for path in cs:
-        role = get_role(path)
-        name = tunnel_name(path)
-        svc = service_for(path)
-        active = service_active(svc)
-        remote = None
-        if role == 'client':
-            try:
-                text = open(path, encoding='utf-8', errors='ignore').read()
-                m = re.search(r'^\s*addr:\s*["\']?([^"\'\s]+)', text, re.M)
-                remote = m.group(1) if m else None
-            except OSError:
-                pass
-        items.append({'name': name, 'role': role, 'service': svc, 'active': active,
-                      'remote': remote, 'config': path})
-    roles = {x['role'] for x in items}
-    if 'server' in roles and 'client' in roles: role = 'mixed'
-    elif 'server' in roles: role = 'server'
-    elif 'client' in roles: role = 'client'
-    else: role = 'none'
-    t = traffic()
-    return {'role': role, 'hostname': socket.gethostname(), 'local_ip': local_ip(),
-            'public_ip': public_ip(), 'cpu': cpu_percent(), 'memory': meminfo(),
-            'disk': disk(), 'uptime': uptime(), 'traffic': t, 'tunnels': items,
-            'server_online': any(x['role']=='server' and x['active'] for x in items),
-            'tunnel_online': any(x['role']=='client' and x['active'] for x in items)}
-
-
-def get_credentials():
-    try:
-        with open(CREDENTIALS, encoding='utf-8') as f: return json.load(f)
-    except Exception: return {'username':'admin','password_hash': hashlib.sha256(b'admin').hexdigest()}
-
-def authorized(handler):
-    raw = handler.headers.get('Cookie','')
-    c = cookies.SimpleCookie(); c.load(raw)
-    token = c.get('paqet_session')
-    return bool(token and token.value in SESSIONS)
-
-def ping(host, count=5):
-    if not re.match(r'^[A-Za-z0-9_.:-]+$', host or ''):
-        return {'ok': False, 'error': 'Invalid host'}
-    rc, out = run(['ping', '-c', str(max(1, min(int(count), 10))), '-W', '2', host], 20)
-    avg = None; loss = None
-    m = re.search(r'(\d+(?:\.\d+)?)% packet loss', out)
-    if m: loss = float(m.group(1))
-    m = re.search(r'=\s*([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms', out)
-    if m: avg = float(m.group(2))
-    return {'ok': rc == 0, 'host': host, 'avg_ms': avg, 'packet_loss': loss, 'raw': out[-3000:]}
-
-
-def speedtest():
-    # Prefer an installed speedtest-cli binary when available.
-    for binary in ('speedtest', 'speedtest-cli'):
-        rc, out = run([binary, '--simple'], 60)
-        if rc == 0:
-            down = re.search(r'Download:\s*([\d.]+)\s*Mbit/s', out, re.I)
-            up = re.search(r'Upload:\s*([\d.]+)\s*Mbit/s', out, re.I)
-            lat = re.search(r'Ping:\s*([\d.]+)\s*ms', out, re.I)
-            return {'ok': True, 'download_mbps': float(down.group(1)) if down else None,
-                    'upload_mbps': float(up.group(1)) if up else None,
-                    'latency_ms': float(lat.group(1)) if lat else None, 'raw': out}
-    # Lightweight server-side download benchmark fallback. Upload is intentionally
-    # reported as unavailable instead of fabricating a number.
-    url = 'https://speed.cloudflare.com/__down?bytes=25000000'
-    rc, out = run(['curl', '-4', '-L', '-o', '/dev/null', '-sS', '-w', '%{speed_download} %{time_total}',
-                   '--max-time', '30', url], 35)
-    try:
-        bps, secs = map(float, out.split())
-        return {'ok': rc == 0, 'download_mbps': round(bps*8/1e6, 2), 'upload_mbps': None,
-                'latency_ms': None, 'raw': 'Cloudflare download benchmark'}
-    except Exception:
-        return {'ok': False, 'error': 'No speedtest binary and fallback benchmark failed', 'raw': out}
-
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = 'PAQETPanel/1.0'
-    def log_message(self, *_): pass
     def send_json(self, obj, code=200):
-        body = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code); self.send_header('Content-Type','application/json; charset=utf-8')
-        self.send_header('Cache-Control','no-store'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+        self.send_bytes(json.dumps(obj, ensure_ascii=False).encode(), 'application/json; charset=utf-8', code)
+
+    def body(self):
+        n = int(self.headers.get('Content-Length', '0'))
+        return json.loads(self.rfile.read(n) or b'{}')
+
+    def auth(self):
+        return self.headers.get('X-Session', '') in SESSIONS
+
     def do_GET(self):
-        p = urlparse(self.path)
-        if p.path == '/api/auth': return self.send_json({'authenticated': authorized(self)})
-        if p.path.startswith('/api/') and not authorized(self): return self.send_json({'ok':False,'error':'Authentication required'},401)
-        if p.path == '/api/status': return self.send_json(state())
-        if p.path == '/api/ping':
-            q = parse_qs(p.query); return self.send_json(ping(q.get('host',['1.1.1.1'])[0]))
-        if p.path == '/api/speedtest': return self.send_json(speedtest())
-        if p.path == '/api/logs':
-            q=parse_qs(p.query); name=q.get('service',['paqet'])[0]
-            if not re.match(r'^paqet(?:-[A-Za-z0-9_.-]+)?$', name): return self.send_json({'ok':False,'error':'Invalid service'},400)
-            rc,out=run(['journalctl','-u',name,'-n','100','--no-pager','-o','short-iso'],8)
-            return self.send_json({'ok':rc==0,'service':name,'logs':out})
-        path = p.path.lstrip('/') or 'index.html'
-        if '..' in path: return self.send_error(400)
-        full = os.path.join(STATIC, path)
-        if not os.path.isfile(full): full = os.path.join(STATIC, 'index.html')
-        ctype = 'text/html; charset=utf-8' if full.endswith('.html') else 'text/css' if full.endswith('.css') else 'application/javascript' if full.endswith('.js') else 'image/jpeg' if full.endswith('.jpg') else 'application/octet-stream'
-        data = open(full,'rb').read(); self.send_response(200); self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+        path = urlparse(self.path).path
+        if path in ('/', '/index.html'):
+            try:
+                with open(os.path.join(STATIC_DIR, 'index.html'), 'rb') as f:
+                    return self.send_bytes(f.read(), 'text/html; charset=utf-8')
+            except Exception:
+                return self.send_json({'error': 'Panel assets missing'}, 500)
+        if path.startswith('/static/'):
+            rel = unquote(path[len('/static/'):]).lstrip('/')
+            full = os.path.normpath(os.path.join(STATIC_DIR, rel))
+            if not full.startswith(os.path.abspath(STATIC_DIR) + os.sep) or not os.path.isfile(full):
+                return self.send_json({'error': 'Not found'}, 404)
+            ctype = 'image/png' if full.endswith('.png') else 'image/svg+xml' if full.endswith('.svg') else 'text/plain; charset=utf-8'
+            with open(full, 'rb') as f:
+                return self.send_bytes(f.read(), ctype)
+        if path == '/api/bootstrap':
+            return self.send_json({'ok': True, 'authenticated': self.auth(), 'port': PORT, 'project': 'paqet-tunnel', 'author': 'durwinam'})
+        if not self.auth():
+            return self.send_json({'error': 'unauthorized'}, 401)
+        if path == '/api/network':
+            return self.send_json(network_info())
+        if path == '/api/dashboard':
+            rows = service_rows()
+            return self.send_json({'metrics': metrics(), 'services': rows, 'endpoints': infer_endpoints(), 'tunnels': meta(), 'config_exists': bool(infer_endpoints())})
+        if path == '/api/logs':
+            q = parse_qs(urlparse(self.path).query).get('service', ['paqet'])[0]
+            if not re.fullmatch(r'paqet(?:-[A-Za-z0-9_.-]+)?', q): q = 'paqet'
+            rc, out = run(['journalctl', '-u', q, '-n', '160', '--no-pager', '-o', 'short-iso'], 8)
+            return self.send_json({'service': q, 'logs': out})
+        if path == '/api/config':
+            return self.send_json({'config': config_text()})
+        if path == '/api/connection':
+            rows = [x for x in meta() if x.get('role') == 'server']
+            if not rows:
+                return self.send_json({'ok': False, 'error': 'No abroad server configuration found.'}, 404)
+            x = rows[-1]
+            return self.send_json({'ok': True, 'connection': x.get('connection', ''), 'details': x})
+        return self.send_json({'error': 'not found'}, 404)
+
     def do_POST(self):
-        p = urlparse(self.path)
-        if p.path == '/api/login':
-            try: data=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0')) or 0) or b'{}')
-            except Exception: data={}
-            cred=get_credentials(); expected=cred.get('password_hash','')
-            ok=data.get('username')==cred.get('username','admin') and hashlib.sha256(str(data.get('password','')).encode()).hexdigest()==expected
-            if not ok: return self.send_json({'ok':False,'error':'Invalid username or password'},401)
-            token=secrets.token_urlsafe(32); SESSIONS.add(token)
-            body=json.dumps({'ok':True}).encode(); self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Set-Cookie',f'paqet_session={token}; HttpOnly; SameSite=Strict; Path=/'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body); return
-        if p.path.startswith('/api/') and not authorized(self): return self.send_json({'ok':False,'error':'Authentication required'},401)
-        if p.path == '/api/service':
-            n = re.match(r'^paqet(?:-[A-Za-z0-9_.-]+)?$', (parse_qs(p.query).get('name',[''])[0]))
-            action = parse_qs(p.query).get('action',[''])[0]
-            if not n or action not in ('start','stop','restart'): return self.send_json({'ok':False,'error':'Invalid request'},400)
-            name = n.group(0)
+        path = urlparse(self.path).path
+        try:
+            data = self.body()
+        except Exception:
+            data = {}
+        if path == '/api/login':
+            u = str(data.get('username', ''))
+            p = str(data.get('password', ''))
+            if u == AUTH['username'] and hashlib.sha256(p.encode()).hexdigest() == AUTH['password_sha256']:
+                token = secrets.token_urlsafe(32)
+                SESSIONS.add(token)
+                return self.send_json({'ok': True, 'session': token})
+            return self.send_json({'ok': False, 'error': 'Invalid credentials'}, 401)
+        if not self.auth():
+            return self.send_json({'error': 'unauthorized'}, 401)
+
+        if path == '/api/tunnel/create-abroad':
+            try:
+                if not ensure_binary():
+                    raise ValueError('paqet binary is not installed. Run the main paqet-tunnel installer first.')
+                net = data.get('network') or network_info()
+                iface = str(net.get('interface', '')).strip()
+                local_ip = str(net.get('local_ip', '')).strip()
+                public_ip = str(net.get('public_ip', '')).strip()
+                gateway_mac = str(net.get('gateway_mac', '')).strip()
+                if not iface or not valid_ip(local_ip) or not valid_ip(public_ip) or not re.fullmatch(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}', gateway_mac):
+                    raise ValueError('Network settings are incomplete or invalid.')
+                tunnel_port = int(data.get('tunnel_port') or 8888)
+                fwd = str(data.get('forward_ports') or '9090').replace(' ', '')
+                if not valid_port(tunnel_port) or not valid_ports(fwd):
+                    raise ValueError('Invalid tunnel or forward port.')
+                if str(tunnel_port) in [x.strip() for x in fwd.split(',')]:
+                    raise ValueError('Tunnel port cannot be the same as a forwarded port.')
+                key = str(data.get('secret_key') or secrets.token_urlsafe(24))
+                if len(key) < 8:
+                    raise ValueError('Secret key is too short.')
+                cfg = os.path.join(PAQET_DIR, 'config.yaml')
+                text = f'''# paqet Server Configuration\n# Created from PAQET Web Panel\n# inbound_ports: {fwd}\nrole: "server"\n\nlog:\n  level: "info"\n\nlisten:\n  addr: ":{tunnel_port}"\n\nnetwork:\n  interface: "{iface}"\n  ipv4:\n    addr: "{local_ip}:{tunnel_port}"\n    router_mac: "{gateway_mac}"\n  tcp:\n    local_flag: ["PA"]\n    remote_flag: ["PA"]\n  pcap:\n    sockbuf: 8388608\n\ntransport:\n  protocol: "kcp"\n  conn: 1\n  kcp:\n    mode: "fast"\n    key: "{key}"\n    mtu: 1280\n'''
+                os.makedirs(PAQET_DIR, exist_ok=True)
+                with open(cfg, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                server_firewall(tunnel_port)
+                active, service_out = create_service('paqet', cfg)
+                connection = encode_connection(public_ip, tunnel_port, key, fwd)
+                add_meta({'role': 'server', 'service': 'paqet', 'label': 'خارج', 'ip': public_ip, 'tunnel_port': tunnel_port, 'forward_ports': fwd, 'connection': connection, 'created_at': int(time.time()), 'active': active})
+                return self.send_json({'ok': True, 'active': active, 'connection': connection, 'details': {'ip': public_ip, 'tunnel_port': tunnel_port, 'forward_ports': fwd}, 'service_output': service_out})
+            except Exception as e:
+                return self.send_json({'ok': False, 'error': str(e)}, 400)
+
+        if path == '/api/tunnel/decode':
+            try:
+                return self.send_json({'ok': True, 'details': decode_connection(data.get('connection', ''))})
+            except Exception as e:
+                return self.send_json({'ok': False, 'error': str(e)}, 400)
+
+        if path == '/api/tunnel/create-iran':
+            try:
+                if not ensure_binary():
+                    raise ValueError('paqet binary is not installed. Run the main paqet-tunnel installer first.')
+                details = decode_connection(data.get('connection', ''))
+                name = re.sub(r'[^A-Za-z0-9_.-]+', '-', str(data.get('name') or 'iran')).strip('-')[:40] or 'iran'
+                net = data.get('network') or network_info()
+                iface = str(net.get('interface', '')).strip()
+                local_ip = str(net.get('local_ip', '')).strip()
+                gateway_mac = str(net.get('gateway_mac', '')).strip()
+                if not iface or not valid_ip(local_ip) or not re.fullmatch(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}', gateway_mac):
+                    raise ValueError('Iran server network settings are incomplete or invalid.')
+                fwd = str(data.get('forward_ports') or details['fwd']).replace(' ', '')
+                if not valid_ports(fwd):
+                    raise ValueError('Invalid forward port.')
+                if str(details['port']) in [x.strip() for x in fwd.split(',')]:
+                    raise ValueError('Tunnel port cannot be the same as a forwarded port.')
+                cfg = os.path.join(PAQET_DIR, f'config-{name}.yaml')
+                service = f'paqet-{name}'
+                forward_config = ''.join(f'\n  - listen: "0.0.0.0:{p}"\n    target: "127.0.0.1:{p}"\n    protocol: "tcp"' for p in [x.strip() for x in fwd.split(',')])
+                text = f'''# paqet Client Configuration (Port Forwarding Mode)\n# Tunnel: {name}\n# Created from PAQET Web Panel\nrole: "client"\n\nlog:\n  level: "info"\n\nforward:{forward_config}\n\nnetwork:\n  interface: "{iface}"\n  ipv4:\n    addr: "{local_ip}:0"\n    router_mac: "{gateway_mac}"\n  tcp:\n    local_flag: ["PA"]\n    remote_flag: ["PA"]\n  pcap:\n    sockbuf: 4194304\n\nserver:\n  addr: "{details['ip']}:{details['port']}"\n\ntransport:\n  protocol: "kcp"\n  conn: 1\n  kcp:\n    mode: "fast"\n    key: "{details['key']}"\n    mtu: 1280\n'''
+                with open(cfg, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                client_firewall(details['ip'], details['port'])
+                active, service_out = create_service(service, cfg)
+                add_meta({'role': 'client', 'service': service, 'label': 'ایران', 'ip': local_ip, 'server_ip': details['ip'], 'tunnel_port': details['port'], 'forward_ports': fwd, 'created_at': int(time.time()), 'active': active})
+                return self.send_json({'ok': True, 'active': active, 'service': service, 'details': {'server_ip': details['ip'], 'tunnel_port': details['port'], 'forward_ports': fwd}, 'service_output': service_out})
+            except Exception as e:
+                return self.send_json({'ok': False, 'error': str(e)}, 400)
+
+        if path == '/api/service':
+            name = str(data.get('name', ''))
+            action = str(data.get('action', ''))
+            if not re.fullmatch(r'paqet(?:-[A-Za-z0-9_.-]+)?', name) or action not in ('start', 'stop', 'restart'):
+                return self.send_json({'error': 'invalid request'}, 400)
             rc, out = run(['systemctl', action, name], 15)
-            return self.send_json({'ok':rc==0,'service':name,'output':out}, 200 if rc==0 else 500)
-        return self.send_json({'ok':False,'error':'Not found'},404)
+            return self.send_json({'ok': rc == 0, 'output': out}, 200 if rc == 0 else 500)
+
+        if path == '/api/ping':
+            target = str(data.get('target', ''))
+            if not (valid_ip(target) or re.fullmatch(r'[A-Za-z0-9_.:-]+', target)):
+                return self.send_json({'error': 'invalid target'}, 400)
+            rc, out = run(['ping', '-c', '5', '-W', '2', target], 15)
+            avg = loss = None
+            m = re.search(r'=\s*[\d.]+/([\d.]+)/', out)
+            if m: avg = float(m.group(1))
+            m = re.search(r'(\d+(?:\.\d+)?)%\s*packet loss', out)
+            if m: loss = float(m.group(1))
+            return self.send_json({'ok': rc == 0, 'target': target, 'latency_ms': avg, 'packet_loss': loss, 'raw': out})
+
+        if path == '/api/speedtest':
+            for c in (['speedtest', '--simple'], ['speedtest-cli', '--simple']):
+                rc, out = run(c, 60)
+                if rc == 0:
+                    return self.send_json({'ok': True, 'raw': out})
+            return self.send_json({'ok': False, 'message': 'Install speedtest or speedtest-cli on the server to enable Speed Test.'})
+
+        if path == '/api/password':
+            old, new = str(data.get('old', '')), str(data.get('new', ''))
+            if hashlib.sha256(old.encode()).hexdigest() != AUTH['password_sha256'] or len(new) < 8:
+                return self.send_json({'error': 'Invalid current password or new password too short'}, 400)
+            AUTH['password_sha256'] = hashlib.sha256(new.encode()).hexdigest()
+            AUTH.pop('generated_password', None)
+            write_json(STATE_FILE, AUTH)
+            return self.send_json({'ok': True})
+
+        if path == '/api/logout':
+            SESSIONS.discard(self.headers.get('X-Session', ''))
+            return self.send_json({'ok': True})
+        return self.send_json({'error': 'not found'}, 404)
+
 
 if __name__ == '__main__':
-    print(f'PAQET Panel listening on {HOST}:{PORT}')
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    print(f'PAQET Panel listening on :{PORT}')
+    ThreadingHTTPServer((HOST, PORT), H).serve_forever()

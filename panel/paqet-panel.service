@@ -1,0 +1,16 @@
+[Unit]
+Description=PAQET Tunnel Web Panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PAQET_PANEL_PORT=6102
+ExecStart=/usr/bin/env python3 /opt/paqet/panel/server.py
+Restart=always
+RestartSec=2
+User=root
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
